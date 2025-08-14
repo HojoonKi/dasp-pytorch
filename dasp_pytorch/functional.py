@@ -2,9 +2,10 @@ import torch
 import numpy as np
 import scipy.signal
 import dasp_pytorch.signal
+import torchaudio.functional as TAF
 
 from functools import partial
-from typing import Dict, List
+from typing import Dict, List, Union
 # change?
 
 def gain(x: torch.Tensor, sample_rate: int, gain_db: torch.Tensor):
@@ -271,6 +272,51 @@ def parametric_eq(
 
     return x_out
 
+
+def flexible_five_band_eq(
+    x: torch.Tensor,
+    sample_rate: float,
+    bands_params: List[Dict[str, Union[str, torch.Tensor]]],
+):
+    """
+    Applies a cascade of 5 user-defined biquad filters.
+    
+    Args:
+        x (torch.Tensor): Input audio signal. Shape (bs, chs, seq_len).
+        sample_rate (float): Audio sample rate.
+        bands_params (List[Dict]): A list of 5 dictionaries, each defining a filter band.
+            Each dict must contain: 'filter_type', 'gain_db', 'cutoff_freq', 'q_factor'.
+    """
+    assert len(bands_params) == 5, "This function requires exactly 5 bands."
+    
+    bs, chs, seq_len = x.size()
+    
+    # 5개의 필터를 담을 SOS(Second-Order Sections) 행렬 초기화
+    sos = torch.zeros(bs, 5, 6, device=x.device, dtype=x.dtype)
+    
+    # 각 밴드 파라미터를 순회하며 SOS 계수 계산
+    for i, band in enumerate(bands_params):
+        b, a = dasp_pytorch.signal.biquad(
+            gain_db=band['gain_db'],
+            cutoff_freq=band['cutoff_freq'],
+            q_factor=band['q_factor'],
+            sample_rate=sample_rate,
+            filter_type=band['filter_type']
+        )
+        # b와 a 계수를 합쳐서 SOS 행렬의 i번째 행에 저장
+        sos[:, i, :] = torch.cat((b, a), dim=-1)
+
+    # `dasp_pytorch`의 최적화된 SOS 필터링 함수를 사용하여 오디오에 필터 cascade 적용
+    # 이 함수는 (bs * chs, seq_len) 형태의 입력을 기대하므로 reshape
+    x_reshaped = x.view(bs * chs, -1)
+    sos_expanded = sos.repeat_interleave(chs, dim=0) # 각 채널에 동일한 필터 적용
+    
+    y_reshaped = dasp_pytorch.signal.sosfilt(x_reshaped, sos_expanded)
+    
+    # 원래 모양으로 복원
+    y = y_reshaped.view(bs, chs, seq_len)
+    
+    return y
 
 def compressor(
     x: torch.Tensor,
@@ -575,6 +621,84 @@ def noise_shaped_reverberation(
     y = (1 - mix) * x + mix * y
 
     return y
+
+
+def simplified_reverb_optimized(
+    x: torch.Tensor,
+    sample_rate: int,
+    room_size: torch.Tensor,
+    damping: torch.Tensor,
+    diffusion: torch.Tensor,
+    pre_delay_ms: torch.Tensor,
+    wet_gain: torch.Tensor,
+    ir_length: int = 65536,
+    num_bands: int = 12,
+) -> torch.Tensor:
+    """
+    A highly optimized reverb function using FFT-based convolution for maximum speed.
+    All parameter tensors should have shape (bs, 1) or be broadcastable.
+    """
+    device = x.device
+    bs, chs, seq_len = x.shape
+
+    # --- 1. 상위 파라미터를 저수준 밴드 파라미터로 매핑 ---
+    base_decay = (room_size.clamp(0.0, 1.0) * 4.0)
+    damping_curve = torch.linspace(1.0, 1.0 - damping.clamp(0.0, 1.0), steps=num_bands, device=device)
+    band_decays = base_decay * damping_curve
+
+    diffusion = diffusion.clamp(0.0, 1.0)
+    flat_gains = torch.ones(bs, num_bands, device=device)
+    random_gains = torch.rand(bs, num_bands, device=device) * 0.4 + 0.8
+    band_gains = (1 - diffusion) * random_gains + diffusion * flat_gains
+    band_gains /= torch.sqrt(torch.mean(band_gains**2, dim=-1, keepdim=True))
+
+    # --- 2. 노이즈 기반 임펄스 응답(IR) 생성 (최적화 1 적용) ---
+    num_bandpass_taps = 1023
+    filters = dasp_pytorch.signal.octave_band_filterbank(num_bandpass_taps, sample_rate).type_as(x)
+    
+    # FFT 연산을 위한 길이 계산
+    n_fft = ir_length + num_bandpass_taps - 1
+
+    # 노이즈와 필터를 FFT 도메인으로 변환
+    noise = torch.randn(bs, num_bands, ir_length).type_as(x)
+    fft_noise = torch.fft.rfft(noise, n=n_fft)
+    fft_filters = torch.fft.rfft(filters, n=n_fft)
+
+    # 주파수 도메인에서 필터링 (매우 빠름)
+    filtered_noise_fft = fft_noise * fft_filters.unsqueeze(0)
+    filtered_noise = torch.fft.irfft(filtered_noise_fft, n=n_fft)
+    filtered_noise = filtered_noise[..., :ir_length] # 최종 길이로 자르기
+    
+    # 밴드별 Decay 및 Gain 적용
+    t = torch.linspace(0, 1, steps=ir_length, device=device)
+    decay_rate = (band_decays * 10.0) + 1.0
+    envelope = torch.exp(-decay_rate.unsqueeze(-1) * t)
+    shaped_noise = filtered_noise * envelope
+    shaped_noise *= band_gains.unsqueeze(-1)
+
+    # 모든 밴드를 합쳐서 최종 IR 생성
+    impulse_response = torch.sum(shaped_noise, dim=1) # (B, ir_length)
+
+    # --- 3. Pre-delay 적용 ---
+    delay_samples = (pre_delay_ms / 1000.0 * sample_rate).long().squeeze(-1)
+    
+    padded_ir = torch.zeros_like(impulse_response)
+    for i in range(bs):
+        d = delay_samples[i].item()
+        if d < 0 : d=0
+        if d > 0 and d < ir_length:
+            padded_ir[i, d:] = impulse_response[i, :-d]
+        else:
+            padded_ir[i, :] = impulse_response[i, :]
+
+    # --- 4. 컨볼루션으로 리버브 적용 (최적화 2 적용) ---
+    # fftconvolve은 채널별 처리를 위해 IR을 unsqueeze해야 함
+    wet_signal = TAF.fftconvolve(x, padded_ir.unsqueeze(1), mode='same')
+    
+    # --- 5. 최종 Dry/Wet 믹스 ---
+    mix = wet_gain.clamp(0.0, 1.0).view(bs, 1, 1)
+    
+    return (1.0 - mix) * x + mix * wet_signal
 
 
 def stereo_widener(x: torch.Tensor, sample_rate: float, width: torch.Tensor):
