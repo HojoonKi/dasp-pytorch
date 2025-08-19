@@ -115,27 +115,27 @@ def mean_distortion(audio: torch.Tensor, params: Dict) -> torch.Tensor:
         drive_db = params['gain'].view(-1, 1, 1).clamp(0.0, 15.0)
         color = params['color'].view(-1, 1, 1).clamp(-0.9, 0.9)
         
-        # 1. 입력 오디오의 AC RMS 계산 (DC 제거)
+        # 1. Calculate AC RMS of input audio (remove DC component)
         input_mean = torch.mean(audio, dim=-1, keepdim=True)
         input_ac = audio - input_mean
         input_rms = torch.sqrt(torch.mean(input_ac**2, dim=-1, keepdim=True) + 1e-8)
         
-        # 2. dB 기반 드라이브 적용
+        # 2. Apply dB-based drive
         linear_gain = 10 ** (drive_db / 20.0)
         distorted_audio = torch.tanh((audio + color) * linear_gain)
         
-        # 3. 왜곡된 오디오의 AC RMS 계산 (DC 제거)
+        # 3. Calculate AC RMS of distorted audio (remove DC component)
         output_mean = torch.mean(distorted_audio, dim=-1, keepdim=True)
         output_ac = distorted_audio - output_mean
         output_rms = torch.sqrt(torch.mean(output_ac**2, dim=-1, keepdim=True) + 1e-8)
         
-        # 4. 출력 AC RMS를 입력 AC RMS와 맞추도록 스케일링 (0 나누기 방지)
+        # 4. Scale output AC RMS to match input AC RMS (avoid division by zero)
         scale = input_rms / output_rms.clamp(min=1e-8)
         normalized_audio = output_ac * scale
         normalized_audio = 0.7 * normalized_audio + 0.3 * audio
         
-        # 옵션: 원본 input_mean을 추가할 수 있지만, DC 제거를 위해 0으로 유지 추천
-        # normalized_audio += input_mean  # 필요 시 활성화
+        # Option: Add original input_mean back, but keep it at 0 for DC removal
+        # normalized_audio += input_mean  # if needed
         
         return normalized_audio
 
@@ -303,7 +303,7 @@ def parametric_eq(
 import matplotlib.pyplot as plt
 def visualize_filter_response(sos_matrix, sample_rate):
     """
-    주어진 SOS 행렬의 주파수 응답을 시각화합니다. (버그 수정됨)
+    Visualize frequency response of given SOS matrix (bug fixed)
     """
     print("🔬 Visualizing filter frequency response...")
     if sos_matrix.is_cuda:
@@ -332,6 +332,7 @@ def visualize_filter_response(sos_matrix, sample_rate):
     plt.ylim([-40, 10])
     plt.savefig("filter_response.png") 
     print("   -> Saved 'filter_response.png'")
+
 
 def differentiable_flexible_eq(
     x: torch.Tensor,
@@ -376,7 +377,7 @@ def differentiable_flexible_eq(
     
     return y
 
-def differentiable_hybrid_eq( # 함수 이름 변경
+def differentiable_hybrid_eq(
     x: torch.Tensor,
     sample_rate: float,
     bands_params: Dict[str, Dict[str, torch.Tensor]],
@@ -386,13 +387,13 @@ def differentiable_hybrid_eq( # 함수 이름 변경
     Applies a 6-band hybrid EQ with constrained filter types for stable training.
     """
     bs, chs, seq_len = x.size()
-    num_bands = 6  # 고정 6개 밴드
+    num_bands = 6  # fixed 6 bands
     final_sos = torch.zeros(bs, num_bands, 6, device=x.device, dtype=x.dtype)
 
     for i, band_name in enumerate(sorted(bands_params.keys())):
         band_p = bands_params[band_name]
         gain, freq, q = band_p['gain_db'], band_p['center_freq'], band_p['q']
-        # 밴드 인덱스에 따라 필터 타입 후보군을 다르게 설정
+        # Set filter type candidates based on band index
         if i == 0: # Band 1
             filter_types = ["high_pass", "low_shelf"]
         elif i == num_bands - 1: # Last Band
@@ -400,7 +401,7 @@ def differentiable_hybrid_eq( # 함수 이름 변경
         else: # Middle Bands
             filter_types = ["peaking"]
 
-        # 모든 가능한 필터 타입에 대한 계수를 계산
+        # Calculate coefficients for all possible filter types
         all_coeffs = []
         for f_type in filter_types:
             b, a = dasp_pytorch.signal.biquad(gain, freq, q, sample_rate, f_type)
@@ -410,20 +411,20 @@ def differentiable_hybrid_eq( # 함수 이름 변경
         if len(filter_types) > 1:
             logits = band_p['filter_type']
             if training:
-                # 학습 시: Gumbel-Softmax로 미분 가능한 확률적 샘플링
+                # During training: Gumbel-Softmax for differentiable sampling
                 filter_choice_one_hot = torch.nn.functional.gumbel_softmax(logits, tau=1.0, hard=True)
             else:
-                # 평가 시: 가장 확률 높은 필터를 확정적으로 선택
+                # During evaluation: Select most probable filter deterministically
                 indices = torch.argmax(logits, dim=-1)
                 filter_choice_one_hot = torch.nn.functional.one_hot(indices, num_classes=logits.shape[-1]).float()
         else:
             filter_choice_one_hot = torch.ones(bs, 1, device=x.device)
-        # 선택된 필터 계수 계산
+        # Calculate selected filter coefficients
         selected_sos = torch.bmm(filter_choice_one_hot.unsqueeze(1), all_coeffs).squeeze(1)  # (batch_size, 6)
         final_sos[:, i, :] = selected_sos
     x_reshaped = x.view(bs * chs, -1)
     sos_expanded = final_sos.repeat_interleave(chs, dim=0)
-    visualize_filter_response(sos_expanded, sample_rate)
+    # visualize_filter_response(sos_expanded, sample_rate)
     y_reshaped = dasp_pytorch.signal.sosfilt_via_fsm(sos_expanded, x_reshaped)
     
     return y_reshaped.view(bs, chs, seq_len)
@@ -751,13 +752,13 @@ def simplified_reverb_optimized(
     device = x.device
     bs, chs, seq_len = x.shape
 
-    # --- 1. 상위 파라미터를 저수준 밴드 파라미터로 매핑 ---
+    # --- 1. Map higher-level parameters to lower-level band parameters ---
     base_decay = (room_size.clamp(0.0, 1.0) * 4.0)
-    # 0.0에서 1.0까지 변하는 기본 경사(ramp) 생성. 모양: (num_bands,)
+    # Create a basic ramp that varies from 0.0 to 1.0. Shape: (num_bands,)
     ramp = torch.linspace(0.0, 1.0, steps=num_bands, device=device)
-    # damping 파라미터 클램핑. 모양: (bs, 1)
+    # Clamp damping parameter. Shape: (bs, 1)
     damping_clamped = damping.clamp(0.0, 1.0)
-    # 브로드캐스팅을 이용해 배치 단위의 감쇠 곡선 생성
+    # Create a damping curve for each batch unit using broadcasting
     # (bs, 1) * (num_bands,) -> (bs, num_bands)
     damping_curve = 1.0 - damping_clamped * ramp
     band_decays = base_decay * damping_curve
@@ -768,34 +769,34 @@ def simplified_reverb_optimized(
     band_gains = (1 - diffusion) * random_gains + diffusion * flat_gains
     band_gains = band_gains / torch.sqrt(torch.mean(band_gains**2, dim=-1, keepdim=True))
 
-    # --- 2. 노이즈 기반 임펄스 응답(IR) 생성 (최적화 1 적용) ---
+    # --- 2. Create noise-based impulse response (IR) (optimization 1 applied) ---
     num_bandpass_taps = 1023
     filters = dasp_pytorch.signal.octave_band_filterbank(num_bandpass_taps, sample_rate).type_as(x).squeeze(1)
     
-    # FFT 연산을 위한 길이 계산
+    # Calculate length for FFT operations
     n_fft = ir_length + num_bandpass_taps - 1
 
-    # 노이즈와 필터를 FFT 도메인으로 변환
+    # Convert noise and filters to FFT domain
     noise = torch.randn(bs, num_bands, ir_length).type_as(x)
     fft_noise = torch.fft.rfft(noise, n=n_fft)
     fft_filters = torch.fft.rfft(filters, n=n_fft)
 
-    # 주파수 도메인에서 필터링 (매우 빠름)
+    # Filtering in frequency domain (very fast)
     filtered_noise_fft = fft_noise * fft_filters.unsqueeze(0)
     filtered_noise = torch.fft.irfft(filtered_noise_fft, n=n_fft)
-    filtered_noise = filtered_noise[..., :ir_length] # 최종 길이로 자르기
+    filtered_noise = filtered_noise[..., :ir_length] # Cut to final length
     
-    # 밴드별 Decay 및 Gain 적용
+    # Apply band-wise decay and gain
     t = torch.linspace(0, 1, steps=ir_length, device=device)
     decay_rate = (band_decays * 10.0) + 1.0
     envelope = torch.exp(-decay_rate.unsqueeze(-1) * t)
     shaped_noise = filtered_noise * envelope
     shaped_noise *= band_gains.unsqueeze(-1)
 
-    # 모든 밴드를 합쳐서 최종 IR 생성
+    # Sum all bands to create final IR
     impulse_response = torch.sum(shaped_noise, dim=1) # (B, ir_length)
 
-    # --- 3. Pre-delay 적용 ---
+    # --- 3. Apply pre-delay ---
     delay_samples = (pre_delay * sample_rate).long().squeeze(-1)
     
     padded_ir = torch.zeros_like(impulse_response)
@@ -807,15 +808,16 @@ def simplified_reverb_optimized(
         else:
             padded_ir[i, :] = impulse_response[i, :]
 
-    # --- 4. 컨볼루션으로 리버브 적용 (최적화 2 적용) ---
-    # fftconvolve은 채널별 처리를 위해 IR을 unsqueeze해야 함
+    # --- 4. Apply reverb using convolution (optimization 2 applied) ---
+    # fftconvolve requires IR to be unsqueeze for channel-wise processing
     wet_signal = TAF.fftconvolve(x, padded_ir.unsqueeze(1), mode='same')
     
-    # --- 5. 최종 Dry/Wet 믹스 ---
+    # --- 5. Final Dry/Wet mix ---
     wet_level = 0.7
     mix = wet_gain.clamp(0.0, 1.0).view(bs, 1, 1)
     
     return (1.0 - mix) * x + mix * (wet_level * wet_signal)
+
 
 def professional_reverb_optimized(
     x: torch.Tensor,
@@ -836,7 +838,7 @@ def professional_reverb_optimized(
     device, bs, chs, seq_len = x.device, x.shape[0], x.shape[1], x.shape[2]
     def sigmoid(z, growth_rate=1.0, midpoint=5.0):
         return 1 / (1 + torch.exp(-growth_rate * (z - midpoint)))
-    # --- 1. 감쇠(Decay) 및 댐핑(Damping) 파라미터로 'Envelope' 생성 ---
+    # --- 1. Create 'Envelope' from decay and damping parameters ---
     rt60 = decay_time.clamp(0.1, ir_length/sample_rate)
 
     ramp = torch.linspace(0.0, 1.0, steps=num_bands, device=device)
@@ -847,15 +849,15 @@ def professional_reverb_optimized(
     t_samples = torch.arange(ir_length, device=device)
     decay_constants_reshaped = decay_constants.unsqueeze(-1)
     
-    # t_samples의 모양을 (ir_length,)로 유지
-    # 브로드캐스팅: (bs, num_bands, 1) * (ir_length,) -> (bs, num_bands, ir_length)
+    # Keep t_samples shape as (ir_length,)
+    # Broadcasting: (bs, num_bands, 1) * (ir_length,) -> (bs, num_bands, ir_length)
     envelope = torch.exp(-decay_constants_reshaped * t_samples)
     
-    # 최종적으로 shaped_noise와 곱해지기 위해 스테레오 채널 차원 추가
+    # Add stereo channel dimension for final multiplication with shaped_noise
     # (bs, num_bands, ir_length) -> (bs, 1, num_bands, ir_length)
     envelope = envelope.unsqueeze(1)
 
-    # --- 2. 노이즈 생성 및 감쇠 적용 ---
+    # --- 2. Create noise and apply decay ---
     num_bandpass_taps = 1023
     filters = dasp_pytorch.signal.octave_band_filterbank(num_bandpass_taps, sample_rate).type_as(x)
     n_fft_ir = ir_length + num_bandpass_taps - 1
@@ -867,40 +869,39 @@ def professional_reverb_optimized(
     filtered_noise_fft = fft_noise * fft_filters.view(1, 1, num_bands, -1)
     filtered_noise = torch.fft.irfft(filtered_noise_fft, n=n_fft_ir, dim=-1)[..., :ir_length]
     
-    # 노이즈에 Envelope를 먼저 적용하여 감쇠하는 잔향의 기초를 만듦
+    # Apply Envelope to noise first to create the basis of decaying reverb
     shaped_noise = filtered_noise * envelope
     decaying_impulse = torch.sum(shaped_noise, dim=2)
 
-    # --- 3. 디퓨전 적용 ---
+    # --- 3. Apply diffusion ---
     diffusion_g = diffusion.clamp(0.0, 1.0).squeeze(-1) * 0.5
     base_delay_lengths = [157, 239, 347, 479]
     n_fft_diffusion = ir_length
 
+    # Create frequency axis (omega) in advance. Shape: (n_fft/2 + 1,)
+    w = torch.linspace(0, torch.pi, n_fft_diffusion // 2 + 1, device=device)
+
     H_total = torch.ones(bs, 2, n_fft_diffusion // 2 + 1, device=device, dtype=torch.complex64)
+
     for d_len_base in base_delay_lengths:
-        # ⬇️ (핵심 수정) for 루프를 제거하고 벡터화 연산 시작
-        
-        # 1. 배치별 딜레이 길이 계산
+        # 1. Calculate batch-wise float delay length
+        # room_size shape: (bs, 1) -> size_scale shape: (bs,)
         size_scale = 0.5 + (room_size.clamp(0.0, 10.0).squeeze(-1) / 10.0)
-        d_len = (d_len_base * size_scale).long() # (bs,)
-        max_d = torch.max(d_len) # 배치 내 최대 딜레이 길이
+        d_len_float = d_len_base * size_scale # shape: (bs,)
+
+        # 2. Calculate frequency response H(w) of all-pass filter in frequency domain
+        # PyTorch's broadcasting is used to perform the operation for the entire batch at once.
+        # w (1, n_fft/2+1) * d_len_float (bs, 1) -> phase_shift (bs, n_fft/2+1)
+        phase_shift = torch.exp(-1j * w.unsqueeze(0) * d_len_float.unsqueeze(-1))
         
-        # 2. max_d를 기준으로 계수 텐서 생성
-        b_coeffs = torch.zeros(bs, max_d + 1, device=device)
-        a_coeffs = torch.zeros(bs, max_d + 1, device=device)
+        # diffusion_g (bs, 1)
+        g = diffusion_g.unsqueeze(-1)
         
-        # 3. scatter_를 이용해 값 삽입
-        # b_coeffs의 0번째 열에 diffusion_g 삽입
-        b_coeffs[:, 0] = diffusion_g
-        # b_coeffs의 각 행(i)의 d_len[i] 열에 1.0 삽입
-        b_coeffs.scatter_(1, d_len.unsqueeze(-1), 1.0)
-        
-        # a_coeffs도 동일하게 처리
-        a_coeffs[:, 0] = 1.0
-        a_coeffs.scatter_(1, d_len.unsqueeze(-1), diffusion_g.unsqueeze(-1))
-        
-        # 4. 벡터화된 계수로 주파수 응답 한 번에 계산
-        H_i = dasp_pytorch.signal.fft_freqz(b_coeffs, a_coeffs, n_fft=n_fft_diffusion)
+        # All operations are element-wise, perfectly vectorized.
+        H_i = (g + phase_shift) / (1 + g * phase_shift)
+
+        # 3. Multiply by entire frequency response (broadcasting to stereo channels)
+        # Multiply H_i (bs, 1, n_fft/2+1) by H_total (bs, 2, n_fft/2+1)
         H_total *= H_i.unsqueeze(1)
 
     fft_ir = torch.fft.rfft(decaying_impulse, n=n_fft_diffusion, dim=-1)
@@ -910,7 +911,7 @@ def professional_reverb_optimized(
     stable_ir = diffused_ir / (peak_val + 1e-8)
     stable_ir = torch.tanh(stable_ir)
 
-    # --- 4. Pre-delay 적용 ---
+    # --- 4. Apply pre-delay ---
     delay_samples = (pre_delay * sample_rate).clamp(0, ir_length / 2)
     delay_normalized = delay_samples * 2.0 / ir_length
     base_x_grid = torch.linspace(-1, 1, ir_length, device=device)
@@ -918,7 +919,7 @@ def professional_reverb_optimized(
     shifted_y_grid = torch.zeros_like(shifted_x_grid)
     grid = torch.stack([shifted_x_grid, shifted_y_grid], dim=-1).unsqueeze(1)
     padded_ir = torch.nn.functional.grid_sample(stable_ir.unsqueeze(2), grid, mode='bilinear', padding_mode='zeros', align_corners=False).squeeze(2)
-    # --- 5. 최종 컨볼루션 및 믹스 ---
+    # --- 5. Final convolution and mix ---
     if chs == 1: 
         x = x.repeat(1, 2, 1)
         
